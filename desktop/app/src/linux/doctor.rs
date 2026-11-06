@@ -603,10 +603,10 @@ pub fn linux_checks() -> Vec<(String, String, bool, String, Option<&'static str>
 
     check(
         "linux-v4l2loopback",
-        has_v4l2loopback(),
+        has_v4l2loopback() || super::vcam::is_pipewire_available(),
         tr!("Doctor", "Phone as webcam is ready"),
         tr!("Doctor", "Phone as webcam needs one more step"),
-        tr!("Doctor", "Install v4l2loopback-dkms, then restart, so apps can use your phone as a camera."),
+        tr!("Doctor", "Install v4l2loopback-dkms or run PipeWire, so apps can use your phone as a camera."),
     );
 
     out
