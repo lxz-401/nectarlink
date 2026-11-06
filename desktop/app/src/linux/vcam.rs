@@ -158,8 +158,24 @@ pub fn dll_path() -> Option<PathBuf> {
 }
 
 /// Returns `true` if `v4l2loopback` is currently loaded in the kernel or exposes a loopback node.
-pub fn is_registered() -> bool {
+pub fn is_v4l2_registered() -> bool {
     find_v4l2loopback_device().is_some() || PathBuf::from("/sys/module/v4l2loopback").exists()
+}
+
+/// Returns `true` if PipeWire is active on this Linux desktop session.
+pub fn is_pipewire_available() -> bool {
+    if let Some(runtime_dir) = dirs::runtime_dir() {
+        if runtime_dir.join("pipewire-0").exists() {
+            return true;
+        }
+    }
+    super::run_cmd_timeout("pw-cli", &["info", "0"], Duration::from_millis(300))
+        .is_some_and(|o| o.status.success())
+}
+
+/// Returns `true` if either `v4l2loopback` is loaded or PipeWire is running and available.
+pub fn is_registered() -> bool {
+    is_v4l2_registered() || is_pipewire_available()
 }
 
 /// Ensures `v4l2loopback` is registered, attempting `register_hklm()` when not already active.
@@ -240,6 +256,16 @@ pub fn run_elevated(arg: &'static str, on_done: impl FnOnce(bool) + Send + 'stat
     });
 }
 
+/// Maps a vertical resolution (`height`) to standard 16:9 widescreen dimensions:
+/// 4K UHD (`3840×2160`), 1080p Full HD (`1920×1080`), or 720p HD (`1280×720`).
+pub fn target_dimensions(height: u32) -> (u32, u32) {
+    match height {
+        2000.. => (3840, 2160),
+        1000.. => (1920, 1080),
+        _ => (1280, 720),
+    }
+}
+
 /// Converts top-down BGRX (`width * height * 4`) to packed YUYV 4:2:2 (`even_width * height * 2`)
 /// using BT.601 studio-swing integer math.
 pub fn bgrx_to_yuyv(bgrx: &[u8], width: u32, height: u32, yuyv: &mut Vec<u8>) {
@@ -251,22 +277,27 @@ pub fn bgrx_to_yuyv(bgrx: &[u8], width: u32, height: u32, yuyv: &mut Vec<u8>) {
     }
     let even_w = (w + 1) & !1;
     let total_bytes = even_w * h * 2;
-    yuyv.resize(total_bytes, 0);
+    if yuyv.len() != total_bytes {
+        yuyv.resize(total_bytes, 0);
+    }
+
+    let even_pairs = w / 2;
+    let has_odd = (w & 1) != 0;
 
     for y in 0..h {
         let src_row = &bgrx[y * w * 4..(y + 1) * w * 4];
         let dst_row = &mut yuyv[y * even_w * 2..(y + 1) * even_w * 2];
-        for pair in 0..(even_w / 2) {
-            let x0 = pair * 2;
-            let x1 = (x0 + 1).min(w - 1);
 
-            let b0 = i32::from(src_row[x0 * 4]);
-            let g0 = i32::from(src_row[x0 * 4 + 1]);
-            let r0 = i32::from(src_row[x0 * 4 + 2]);
+        // Fast path for pairs of pixels (720p, 1080p, and 4K UHD all have even widths)
+        for pair in 0..even_pairs {
+            let src_off = pair * 8;
+            let b0 = i32::from(src_row[src_off]);
+            let g0 = i32::from(src_row[src_off + 1]);
+            let r0 = i32::from(src_row[src_off + 2]);
 
-            let b1 = i32::from(src_row[x1 * 4]);
-            let g1 = i32::from(src_row[x1 * 4 + 1]);
-            let r1 = i32::from(src_row[x1 * 4 + 2]);
+            let b1 = i32::from(src_row[src_off + 4]);
+            let g1 = i32::from(src_row[src_off + 5]);
+            let r1 = i32::from(src_row[src_off + 6]);
 
             let y0 = (((66 * r0 + 129 * g0 + 25 * b0 + 128) >> 8) + 16).clamp(16, 235) as u8;
             let y1 = (((66 * r1 + 129 * g1 + 25 * b1 + 128) >> 8) + 16).clamp(16, 235) as u8;
@@ -282,6 +313,24 @@ pub fn bgrx_to_yuyv(bgrx: &[u8], width: u32, height: u32, yuyv: &mut Vec<u8>) {
             dst_row[dst_off] = y0;
             dst_row[dst_off + 1] = u;
             dst_row[dst_off + 2] = y1;
+            dst_row[dst_off + 3] = v;
+        }
+
+        if has_odd {
+            let pair = even_pairs;
+            let x0 = pair * 2;
+            let b0 = i32::from(src_row[x0 * 4]);
+            let g0 = i32::from(src_row[x0 * 4 + 1]);
+            let r0 = i32::from(src_row[x0 * 4 + 2]);
+
+            let y0 = (((66 * r0 + 129 * g0 + 25 * b0 + 128) >> 8) + 16).clamp(16, 235) as u8;
+            let u = (((-38 * r0 - 74 * g0 + 112 * b0 + 128) >> 8) + 128).clamp(16, 240) as u8;
+            let v = (((112 * r0 - 94 * g0 - 18 * b0 + 128) >> 8) + 128).clamp(16, 240) as u8;
+
+            let dst_off = pair * 4;
+            dst_row[dst_off] = y0;
+            dst_row[dst_off + 1] = u;
+            dst_row[dst_off + 2] = y0;
             dst_row[dst_off + 3] = v;
         }
     }
@@ -351,9 +400,6 @@ fn configure_v4l2_yuyv(fd: i32, width: u32, height: u32) -> bool {
 }
 
 fn v4l2_worker_loop(stop: &AtomicBool) {
-    const OUT_W: u32 = 1280;
-    const OUT_H: u32 = 720;
-
     let mut mapping: Option<SharedFrameMapping> = None;
     let mut v4l2_file: Option<fs::File> = None;
     let mut configured_dims: Option<(u32, u32)> = None;
@@ -382,23 +428,27 @@ fn v4l2_worker_loop(stop: &AtomicBool) {
             continue;
         };
 
-        if bgrx.len() != (OUT_W * OUT_H * 4) as usize {
-            bgrx.resize((OUT_W * OUT_H * 4) as usize, 0);
+        // Dynamically resolve target resolution from user settings / active phone stream.
+        let (out_w, out_h) = target_dimensions(crate::webcam::height());
+        let needed_bgrx = (out_w * out_h * 4) as usize;
+
+        if bgrx.len() != needed_bgrx {
+            bgrx.resize(needed_bgrx, 0);
         }
 
-        let state = map.read_bgrx(OUT_W, OUT_H, &mut bgrx);
+        let state = map.read_bgrx(out_w, out_h, &mut bgrx);
         if state.0 && last_ts == Some(state) {
             thread::sleep(Duration::from_millis(8));
             continue;
         }
         last_ts = Some(state);
 
-        if configured_dims != Some((OUT_W, OUT_H)) {
-            let _ = configure_v4l2_yuyv(dev.as_raw_fd(), OUT_W, OUT_H);
-            configured_dims = Some((OUT_W, OUT_H));
+        if configured_dims != Some((out_w, out_h)) {
+            let _ = configure_v4l2_yuyv(dev.as_raw_fd(), out_w, out_h);
+            configured_dims = Some((out_w, out_h));
         }
 
-        bgrx_to_yuyv(&bgrx, OUT_W, OUT_H, &mut yuyv);
+        bgrx_to_yuyv(&bgrx, out_w, out_h, &mut yuyv);
         if dev.write_all(&yuyv).is_err() {
             v4l2_file = None;
             configured_dims = None;
@@ -463,5 +513,39 @@ mod tests {
     fn virtual_camera_handle_starts_and_drops_cleanly() {
         let handle = VirtualCameraHandle::start().expect("should spawn vcam-v4l2 worker");
         drop(handle);
+    }
+
+    #[test]
+    fn maps_target_dimensions_to_standard_resolutions() {
+        assert_eq!(target_dimensions(2160), (3840, 2160));
+        assert_eq!(target_dimensions(4000), (3840, 2160));
+        assert_eq!(target_dimensions(1080), (1920, 1080));
+        assert_eq!(target_dimensions(1440), (1920, 1080));
+        assert_eq!(target_dimensions(720), (1280, 720));
+        assert_eq!(target_dimensions(480), (1280, 720));
+        assert_eq!(target_dimensions(0), (1280, 720));
+    }
+
+    #[test]
+    fn bgrx_to_yuyv_handles_1080p_and_4k_buffers() {
+        // 1080p frame (1920x1080)
+        let (w, h) = target_dimensions(1080);
+        let bgrx_1080 = vec![128u8; (w * h * 4) as usize];
+        let mut yuyv = Vec::new();
+        bgrx_to_yuyv(&bgrx_1080, w, h, &mut yuyv);
+        assert_eq!(yuyv.len(), (w * h * 2) as usize);
+
+        // 4K UHD frame (3840x2160)
+        let (w4k, h4k) = target_dimensions(2160);
+        let bgrx_4k = vec![200u8; (w4k * h4k * 4) as usize];
+        bgrx_to_yuyv(&bgrx_4k, w4k, h4k, &mut yuyv);
+        assert_eq!(yuyv.len(), (w4k * h4k * 2) as usize);
+    }
+
+    #[test]
+    fn checks_pipewire_and_registration_without_panicking() {
+        let _ = is_pipewire_available();
+        let _ = is_v4l2_registered();
+        let _ = is_registered();
     }
 }
